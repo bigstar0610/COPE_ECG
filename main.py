@@ -1,148 +1,140 @@
+"""
+Simplified HRV-based classification model for cardiac event prediction.
+"""
 import pandas as pd
 import numpy as np
-import os
+import json
+from pathlib import Path
 import lightgbm as lgb
-from scipy.stats import ttest_ind, chi2, kendalltau
-from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.metrics import roc_auc_score, average_precision_score
+from sklearn.model_selection import StratifiedKFold, StratifiedShuffleSplit
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score, average_precision_score, roc_curve, precision_recall_curve
 from bayes_opt import BayesianOptimization
+import shap
 
 SEED = 42
 
-def analyze_hrv():
-    df = pd.read_csv('data.csv')
-    
-    results = []
-    
-    hrvs = [col for col in df.columns if col.startswith('HRV_')]
+LGBM_BOUNDS = {
+    'num_leaves': (16, 32),
+    'lambda_l1': (0.7, 0.9),
+    'lambda_l2': (0.9, 1.0),
+    'feature_fraction': (0.6, 0.7),
+    'bagging_fraction': (0.6, 0.9),
+    'min_child_samples': (6, 10),
+    'min_child_weight': (10, 40)
+}
 
-    for param in hrvs:
-        cases = df[df['Label'] == 1].copy()
-        controls = df[df['Label'] == 0].copy()
+RF_BOUNDS = {
+    'n_estimators': (50, 300),
+    'max_depth': (3, 20),
+    'max_features': (0.1, 1.0)
+}
+
+LR_BOUNDS = {
+    'C': (1e-3, 10)
+}
+
+LGBM_FIXED = {
+    'objective': 'binary',
+    'learning_rate': 0.005,
+    'bagging_freq': 1,
+    'force_row_wise': True,
+    'max_depth': 5,
+    'verbose': -1,
+    'random_state': SEED,
+    'n_jobs': -1
+}
+
+def load_and_prepare_data(data_path, hours):
+    """Load and prepare data for the specified time interval."""
+    df = pd.read_csv(data_path)
+    
+    target_segment = hours * 60  
+    df_filtered = df[(df['Time_segment'] > target_segment - 30) & 
+                     (df['Time_segment'] <= target_segment)].copy()
+    
+    feature_cols = [col for col in df.columns if col.startswith('HRV_')]
+    filled_data = pd.DataFrame()
+    
+    for case_id, case_group in df_filtered.groupby('Case_ID'):
+        case_data = case_group.copy()
+        for (time_seg, label), group in case_group.groupby(['Time_segment', 'Label']):
+            medians = group[feature_cols].median(skipna=True)
+            mask = (case_data['Time_segment'] == time_seg) & (case_data['Label'] == label)
+            for col in feature_cols:
+                case_data.loc[mask & case_data[col].isna(), col] = medians[col]
+        filled_data = pd.concat([filled_data, case_data.dropna(subset=feature_cols)])
+    
+    X = filled_data[feature_cols]
+    y = filled_data['Label']
+    
+    case_ids = filled_data['Case_ID'].unique()
+    case_labels = {cid: filled_data[filled_data['Case_ID'] == cid]['Label'].mode()[0] 
+                   for cid in case_ids}
+    case_df = pd.DataFrame(list(case_labels.items()), columns=['Case_ID', 'Label'])
+    
+    splitter = StratifiedShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
+    train_cases, test_cases = next(splitter.split(case_df[['Case_ID']], case_df['Label']))
+    
+    train_case_ids = case_df.iloc[train_cases]['Case_ID'].values
+    test_case_ids = case_df.iloc[test_cases]['Case_ID'].values
+    
+    train_mask = filled_data['Case_ID'].isin(train_case_ids)
+    test_mask = filled_data['Case_ID'].isin(test_case_ids)
+    
+    X_train, y_train = X[train_mask], y[train_mask]
+    X_test, y_test = X[test_mask], y[test_mask]
+    
+    scaler = StandardScaler()
+    X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), 
+                                  columns=X_train.columns, index=X_train.index)
+    X_test_scaled = pd.DataFrame(scaler.transform(X_test), 
+                                 columns=X_test.columns, index=X_test.index)
+    
+    return X_train_scaled, y_train, X_test_scaled, y_test
+
+def feature_selection_boruta(X_train, y_train, n_trials=20):
+    """Simplified BorutaShap feature selection."""
+    features = list(X_train.columns)
+    accepted = []
+    history = {f: [] for f in features}
+    
+    for trial in range(n_trials):
+        X_shadow = X_train.copy()
+        for col in features:
+            X_shadow[f"shadow_{col}"] = np.random.permutation(X_train[col].values)
         
-        grouped = cases.groupby('Time')[param]
-        means = grouped.mean()
-        stds = grouped.std()
-        counts = grouped.count()
-        
-        valid = ~means.isna() & (means != 0)
-        times = means[valid].index.tolist()
-        
-        control_means = controls.groupby('Time')[param].mean()
-        
-        tstats = []
-        pvals = []
-        
-        for t in times:
-            case_data = cases[cases['Time'] == t][param].dropna().values
-            control_data = controls[controls['Time'] == t][param].dropna().values
-            
-            if len(case_data) > 0 and len(control_data) > 0:
-                tstat, pval = ttest_ind(case_data, control_data, equal_var=False)
-                tstats.append(tstat)
-                pvals.append(pval)
-            else:
-                tstats.append(np.nan)
-                pvals.append(np.nan)
-        
-        valid_pvals = [p for p in pvals if not np.isnan(p)]
-        if valid_pvals:
-            fisher = -2 * np.sum(np.log(valid_pvals))
-            df_fisher = 2 * len(valid_pvals)
-            combined_p = 1 - chi2.cdf(fisher, df_fisher)
+        model = lgb.LGBMClassifier(random_state=SEED, n_jobs=-1, verbosity=-1)
+        model.fit(X_shadow, y_train)
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_shadow)
+        if isinstance(shap_values, list):
+            importance = np.abs(np.array(shap_values)).mean(axis=0).mean(axis=0)
         else:
-            combined_p = np.nan
-            fisher = np.nan
+            importance = np.abs(shap_values).mean(axis=0)
         
-        valid_cases = cases.dropna(subset=[param])
-        tau, tau_p = kendalltau(valid_cases['Time'], valid_cases[param])
+        feature_imp = importance[:len(features)]
+        shadow_imp = importance[len(features):]
+        max_shadow = np.max(shadow_imp)
         
-        result = {
-            'Param': param,
-            'Fisher': fisher,
-            'CombinedP': combined_p,
-            'Significant': combined_p < 0.001 if not np.isnan(combined_p) else False,
-            'Tau': tau,
-            'TauP': tau_p
-        }
-        results.append(result)
+        for i, feature in enumerate(features):
+            history[feature].append(feature_imp[i])
+            if (len(history[feature]) >= 8 and 
+                np.mean([h > max_shadow for h in history[feature][-8:]]) >= 0.7):
+                if feature not in accepted:
+                    accepted.append(feature)
     
-    results_df = pd.DataFrame(results)
-    return results_df
+    return accepted[:15]
 
-def train_model():
-    data = pd.read_csv('data.csv', index_col=0)
-    
-    y = data['label']
-    train_idx = data[data['test']==0].index
-    test_idx = data[data['test']==1].index
-    
-    X = data.drop(columns=['stayid', 'label', 'time', 'test'])
-    Xtrain, Xtest = X.loc[train_idx], X.loc[test_idx]
-    ytrain, ytest = y.loc[train_idx], y.loc[test_idx]
-    
-    dtrain = lgb.Dataset(Xtrain, ytrain)
-    dtest = lgb.Dataset(Xtest, ytest)
-    
-    model = lgb.LGBMClassifier(random_state=SEED, n_jobs=-1)
-    model.fit(Xtrain, ytrain)
-    
-    explainer = shap.TreeExplainer(model)
-    shaps = explainer.shap_values(Xtrain)
-    
-    if isinstance(shaps, list):
-        importance = np.abs(np.array(shaps)).mean(axis=0).mean(axis=0)
-    else:
-        importance = np.abs(shaps).mean(axis=0)
-    
-    features = pd.DataFrame({
-        'Feature': Xtrain.columns,
-        'Importance': importance
-    }).sort_values('Importance', ascending=False)
-    
-    topfeats = features['Feature'].head(15).tolist()
-    
-    bounds = {
-        'num_leaves': (16, 32),
-        'lambda_l1': (0.7, 0.9),
-        'lambda_l2': (0.9, 1.0),
-        'feature_fraction': (0.6, 0.7),
-        'bagging_fraction': (0.6, 0.9),
-        'min_child_samples': (6, 10),
-        'min_child_weight': (10, 40)
-    }
-    
-    params = {
-        'objective': 'binary',
-        'learning_rate': 0.005,
-        'bagging_freq': 1,
-        'force_row_wise': True,
-        'max_depth': 5,
-        'verbose': -1,
-        'random_state': SEED,
-        'n_jobs': -1
-    }
-    
-    def auprc(preds, dtrain):
-        labels = dtrain.get_label()
-        return 'auprc', average_precision_score(labels, preds), True
-    
-    folds = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-    Xvals, yvals = Xtrain.values.astype(float), ytrain.values.flatten().astype(bool)
-    
-    best_params = []
-    best_scores = []
-    
-    for idx, (train_i, valid_i) in enumerate(folds.split(Xvals, yvals)):
-        Xfold, yfold = Xvals[train_i], yvals[train_i]
-        Xval, yval = Xvals[valid_i], yvals[valid_i]
-        
-        train_ds = lgb.Dataset(Xfold, yfold)
-        valid_ds = lgb.Dataset(Xval, yval)
-        
+def optimize_hyperparameters(X_train, y_train, model_name):
+    """Bayesian optimization for hyperparameters."""
+    if model_name == 'lgbm':
+        bounds = LGBM_BOUNDS
         def eval_fn(num_leaves, lambda_l1, lambda_l2, feature_fraction, 
-                  bagging_fraction, min_child_samples, min_child_weight):
-            p = {
+                    bagging_fraction, min_child_samples, min_child_weight):
+            params = {
                 'num_leaves': int(round(num_leaves)),
                 'lambda_l1': lambda_l1,
                 'lambda_l2': lambda_l2,
@@ -150,99 +142,129 @@ def train_model():
                 'bagging_fraction': bagging_fraction,
                 'min_child_samples': int(round(min_child_samples)),
                 'min_child_weight': min_child_weight,
-                'feature_pre_filter': False,
-                **params
+                **LGBM_FIXED
             }
-            
-            m = lgb.train(
-                params=p,
-                train_set=train_ds,
-                num_boost_round=1000,
-                valid_sets=[valid_ds],
-                feval=auprc,
-                early_stopping_rounds=50,
-                verbose_eval=False
-            )
-            
-            pred = m.predict(Xval)
-            score = average_precision_score(yval, pred)
-            return score
+            model = lgb.LGBMClassifier(**params)
+            return cv_score(model, X_train, y_train)
+    
+    elif model_name == 'rf':
+        bounds = RF_BOUNDS
+        def eval_fn(n_estimators, max_depth, max_features):
+            params = {
+                'n_estimators': int(round(n_estimators)),
+                'max_depth': int(round(max_depth)),
+                'max_features': max_features,
+                'random_state': SEED,
+                'n_jobs': -1
+            }
+            model = RandomForestClassifier(**params)
+            return cv_score(model, X_train, y_train)
+    
+    else:  # lr
+        bounds = LR_BOUNDS
+        def eval_fn(C):
+            params = {'C': C, 'solver': 'liblinear', 'random_state': SEED}
+            model = LogisticRegression(**params)
+            return cv_score(model, X_train, y_train)
+    
+    optimizer = BayesianOptimization(f=eval_fn, pbounds=bounds, random_state=SEED)
+    optimizer.maximize(init_points=3, n_iter=15)
+    best_params = optimizer.max['params']
+    
+    if model_name == 'lgbm':
+        best_params['num_leaves'] = int(round(best_params['num_leaves']))
+        best_params['min_child_samples'] = int(round(best_params['min_child_samples']))
+        best_params.update(LGBM_FIXED)
         
-        opt = BayesianOptimization(
-            f=eval_fn,
-            pbounds=bounds,
-            random_state=SEED
-        )
+    elif model_name == 'rf':
+        best_params['n_estimators'] = int(round(best_params['n_estimators']))
+        best_params['max_depth'] = int(round(best_params['max_depth']))
+        best_params.update({'random_state': SEED, 'n_jobs': -1})
         
-        opt.maximize(init_points=3, n_iter=20)
+    else:
+        best_params.update({'solver': 'liblinear', 'random_state': SEED})
+    
+    return best_params
+
+def cv_score(model, X_train, y_train):
+    """Cross-validation scoring."""
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    scores = []
+    
+    for train_idx, val_idx in cv.split(X_train, y_train):
+        X_tr, y_tr = X_train.iloc[train_idx], y_train.iloc[train_idx]
+        X_val, y_val = X_train.iloc[val_idx], y_train.iloc[val_idx]
         
-        best_p = opt.max['params']
-        best_s = opt.max['target']
-        best_params.append(best_p)
-        best_scores.append(best_s)
+        model.fit(X_tr, y_tr)
+        y_pred = model.predict_proba(X_val)[:, 1]
+        scores.append(average_precision_score(y_val, y_pred))
     
-    best_fold = np.argmax(best_scores)
-    best_p = best_params[best_fold]
+    return np.mean(scores)
+
+def train_and_evaluate(X_train, y_train, X_test, y_test, model_name, params):
+    """Train final model and evaluate performance."""
     
-    best_p['num_leaves'] = int(round(best_p['num_leaves']))
-    best_p['min_child_samples'] = int(round(best_p['min_child_samples']))
-    best_p.update(params)
-    
-    iters = []
-    
-    for idx, (train_i, valid_i) in enumerate(folds.split(Xvals, yvals)):
-        Xfold, yfold = Xvals[train_i], yvals[train_i]
-        Xval, yval = Xvals[valid_i], yvals[valid_i]
+    if model_name == 'lgbm':
+        model = lgb.LGBMClassifier(**params)
         
-        train_ds = lgb.Dataset(Xfold, yfold)
-        valid_ds = lgb.Dataset(Xval, yval)
+    elif model_name == 'rf':
+        model = RandomForestClassifier(**params)
         
-        m = lgb.train(
-            params=best_p,
-            train_set=train_ds,
-            num_boost_round=2000,
-            valid_sets=[valid_ds],
-            feval=auprc,
-            early_stopping_rounds=100
-        )
-        
-        iters.append(m.best_iteration)
+    else:  # lr
+        model = LogisticRegression(**params)
     
-    final_iter = int(np.mean(iters))
+    model.fit(X_train, y_train)
+    y_pred_proba = model.predict_proba(X_test)[:, 1]
     
-    final = lgb.train(
-        params=best_p,
-        train_set=dtrain,
-        num_boost_round=final_iter
-    )
+    auroc = roc_auc_score(y_test, y_pred_proba)
+    auprc = average_precision_score(y_test, y_pred_proba)
     
-    probs = final.predict(Xtest, num_iteration=final_iter)
+    fpr, tpr, thresholds = roc_curve(y_test, y_pred_proba)
+    optimal_idx = np.argmax(tpr - fpr)
+    optimal_threshold = thresholds[optimal_idx]
     
-    auroc = roc_auc_score(ytest, probs)
-    auprc = average_precision_score(ytest, probs)
-    
-    results = {
-        'auroc': float(auroc),
-        'auprc': float(auprc),
-        'features': topfeats,
-        'iters': final_iter
-    }
-    
-    return results
+    return {
+        'model': model_name,
+        'auroc': auroc,
+        'auprc': auprc,
+        'threshold': optimal_threshold,
+        'y_pred_proba': y_pred_proba.tolist()
+    }, model
 
 def main():
-    stats = analyze_hrv()
+    """Main pipeline execution."""
+    data_path = 'data.csv'
+    output_dir = Path('results')
+    output_dir.mkdir(exist_ok=True)
     
-    pred = train_model()
+    time_intervals = [2.0, 3.0, 6.0, 8.0, 10.0, 11.5]
+    all_results = []
     
-    print("T-test Statistical Results for HRV Parameters:")
-    for param, row in stats.iterrows():
-        if row['CombinedP'] < 0.05:
-            print(f"Parameter: {row['Param']}, p-value: {row['CombinedP']:.6f}")
+    all_features = set()
+    for hours in time_intervals[:3]:
+        X_train, y_train, _, _ = load_and_prepare_data(data_path, hours)
+        selected = feature_selection_boruta(X_train, y_train, n_trials=15)
+        all_features.update(selected)
+    final_features = list(all_features)[:15]
     
-    print("\nPrediction Model Performance:")
-    print(f"AUROC: {pred['auroc']:.4f}")
-    print(f"AUPRC: {pred['auprc']:.4f}")
+    for hours in time_intervals:
+        X_train, y_train, X_test, y_test = load_and_prepare_data(data_path, hours)
+        X_train_selected = X_train[final_features]
+        X_test_selected = X_test[final_features]
+        
+        best_params = optimize_hyperparameters(X_train_selected, y_train)    
+        results, model = train_and_evaluate(X_train_selected, y_train, 
+                                          X_test_selected, y_test, best_params)
+        results['hours'] = hours
+        all_results.append(results)
+        
+        with open(output_dir / f"results_{hours}hr.json", 'w') as f:
+            json.dump(results, f, indent=2)
+    
+    with open(output_dir / "all_results.json", 'w') as f:
+        json.dump(all_results, f, indent=2)
+    
+    return all_results
 
 if __name__ == '__main__':
     main()
