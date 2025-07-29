@@ -1,6 +1,3 @@
-"""
-Simplified HRV-based classification model for cardiac event prediction.
-"""
 import pandas as pd
 import numpy as np
 import json
